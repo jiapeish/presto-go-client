@@ -590,38 +590,69 @@ func (st *driverStmt) ExecContext(ctx context.Context, args []driver.NamedValue)
 		return nil, err
 	}
 
-	// 等待查询完成
-	for {
-		if sr.NextURI == "" {
-			break
-		}
+	// 如果查询失败，直接返回错误
+	if sr.Stats.State == "FAILED" {
+		return nil, fmt.Errorf("presto: query failed: %v", sr.Error)
+	}
 
-		req, err = st.conn.newRequest("GET", sr.NextURI, nil, nil)
-		if err != nil {
-			return nil, err
-		}
+	// 如果有 NextURI，说明查询还在执行中，需要等待结果
+	if sr.NextURI != "" {
+		// 设置查询超时
+		queryCtx, cancel := context.WithTimeout(ctx, DefaultQueryTimeout)
+		defer cancel()
 
-		resp, err = st.conn.roundTrip(ctx, req)
-		if err != nil {
-			return nil, err
-		}
+		for {
+			select {
+			case <-queryCtx.Done():
+				return nil, fmt.Errorf("presto: query timeout after %v", DefaultQueryTimeout)
+			default:
+				req, err = st.conn.newRequest("GET", sr.NextURI, nil, nil)
+				if err != nil {
+					return nil, err
+				}
 
-		d = json.NewDecoder(resp.Body)
-		d.UseNumber()
-		err = d.Decode(&sr)
-		resp.Body.Close()
-		if err != nil {
-			return nil, fmt.Errorf("presto: %v", err)
-		}
+				resp, err = st.conn.roundTrip(queryCtx, req)
+				if err != nil {
+					return nil, err
+				}
 
-		err = handleResponseError(resp.StatusCode, sr.Error)
-		if err != nil {
-			return nil, err
+				d = json.NewDecoder(resp.Body)
+				d.UseNumber()
+				err = d.Decode(&sr)
+				resp.Body.Close()
+				if err != nil {
+					return nil, fmt.Errorf("presto: %v", err)
+				}
+
+				err = handleResponseError(resp.StatusCode, sr.Error)
+				if err != nil {
+					return nil, err
+				}
+
+				// 如果查询完成，返回结果
+				if sr.Stats.State == "FINISHED" {
+					rows := sr.Stats.ProcessedRows
+					return &driverResult{
+						affectedRows: rows,
+					}, nil
+				}
+
+				// 如果查询失败，返回错误
+				if sr.Stats.State == "FAILED" {
+					return nil, fmt.Errorf("presto: query failed: %v", sr.Error)
+				}
+
+				// 如果查询还在运行，等待一段时间
+				time.Sleep(100 * time.Millisecond)
+			}
 		}
 	}
 
+	// 如果没有 NextURI，说明查询已经完成
+	rows := sr.Stats.ProcessedRows
+
 	return &driverResult{
-		affectedRows: sr.Stats.ProcessedRows,
+		affectedRows: rows,
 	}, nil
 }
 
